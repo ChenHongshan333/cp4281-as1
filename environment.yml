@@ -1,13 +1,15 @@
 name: cp4281-as1
 
 channels:
+  - nvidia/label/cuda-12.6.3
   - conda-forge
 
 dependencies:
   - python=3.11.16
   - pip=26.2.1
-  - setuptools=84.0.0
+  - setuptools=81.0.0
   - wheel=0.48.0
   - ninja=1.13.2
   - cmake=4.4.3
   - git=2.55.0
+  - cuda-toolkit=12.6.3

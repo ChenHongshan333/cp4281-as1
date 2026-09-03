@@ -1,0 +1,12 @@
+=== PyTorch and gsplat ===
+PyTorch: 2.7.1+cu126
+PyTorch CUDA runtime: 12.6
+CUDA available: True
+GPU: NVIDIA GeForce RTX 4060 Laptop GPU
+Rendered colors: (1, 64, 64, 3)
+Rendered alphas: (1, 64, 64, 1)
+gsplat.rasterization: OK
+
+=== COLMAP ===
+COLMAP 3.11.1 -- Structure-from-Motion and Multi-View Stereo
+(Commit 682ea9a on 2024-12-06 with CUDA)
