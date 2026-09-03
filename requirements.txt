@@ -1,0 +1,6 @@
+# Step 1 has no pip-installed runtime dependencies.
+#
+# PyTorch and gsplat will be added in Step 2 after the CUDA versions have been
+# selected and verified. Regenerate this file from the activated environment:
+#
+#   python -m pip freeze > requirements.txt
