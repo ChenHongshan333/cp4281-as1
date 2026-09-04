@@ -814,3 +814,54 @@ video with 720 readable frames at 30 FPS (24.0 seconds), a resolution of
 1600x1200, and a size of 12.50 MiB. Rendering took 28.65 seconds. The scripted
 trajectory looks continuously at the reconstructed focus point and is
 arc-length resampled for smooth, near-constant camera speed.
+
+## Optional extension: lighter training at matched quality
+
+The default `truck` run refines and densifies the representation until step
+15,000. To measure whether stopping densification earlier could reduce resource
+use without materially reducing quality, a controlled second run changed only
+`RefineStopIter` from 15,000 to 8,000. The dataset, COLMAP initialization,
+30,000 total optimization steps, held-out split, spherical-harmonic degree,
+packed rasterization, and all other training settings remained unchanged.
+
+The lightweight run used:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\run_gsplat_windows.ps1" `
+  -DataDirectory "F:\CP4281-data\sample_scenes\our_reconstruction\truck\processed" `
+  -ResultDirectory "F:\CP4281-data\sample_scenes\our_reconstruction\truck\training_refine8000" `
+  -MaxSteps 30000 `
+  -EvalSteps 30000 `
+  -SaveSteps 30000 `
+  -RefineStopIter 8000 `
+  -DisableVideo
+```
+
+Both runs completed all 30,000 steps and produced final checkpoints and the
+same 32 held-out validation views.
+
+| Measurement | Baseline: refine to 15k | Lightweight: refine to 8k | Change |
+|---|---:|---:|---:|
+| Final Gaussians | 2,480,237 | 1,907,386 | -23.10% |
+| Peak allocated VRAM | 3.632 GiB | 2.797 GiB | -22.98% |
+| Trainer time | 2,357.86 s | 2,152.00 s | -8.73% |
+| Total wall-clock time | 00:40:48.7897638 | 00:37:35.6148782 | -7.89% |
+| Checkpoint size | 558.22 MiB | 429.29 MiB | -23.10% |
+| Held-out PSNR | 26.081238 dB | 26.080711 dB | -0.000526 dB |
+| Held-out SSIM | 0.896770 | 0.896792 | +0.000022 |
+| Held-out LPIPS (lower is better) | 0.095868 | 0.096785 | +0.000917 |
+
+The earlier stop reduced Gaussian count, peak VRAM, and checkpoint size by
+about 23%, while reducing trainer time by 8.73%. PSNR and SSIM were effectively
+unchanged. LPIPS became slightly worse, so the result is not entirely free of a
+perceptual quality cost, but the difference is small relative to the resource
+savings. Across the 32 corresponding rendered halves of the validation images,
+the baseline and lightweight outputs have a mean absolute RGB difference of
+0.01685 on a `[0, 1]` scale and a mean between-model PSNR of 30.81 dB. This
+supports treating the two configurations as matched-quality results.
+
+The speedup is smaller than the Gaussian-count reduction because both runs
+still perform 30,000 optimization steps and share fixed data-loading and
+evaluation costs. The main benefit is a substantially lighter representation
+with lower peak memory and storage requirements.
