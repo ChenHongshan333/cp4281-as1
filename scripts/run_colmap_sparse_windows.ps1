@@ -6,6 +6,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$WorkspacePath,
 
+    [ValidateSet("single", "per-folder", "per-image", "auto")]
+    [string]$CameraGrouping = "single",
+
     [string]$ColmapLauncher = "D:\Tools\COLMAP-3.11.1\COLMAP.bat"
 )
 
@@ -55,10 +58,17 @@ function Invoke-ColmapStage {
 }
 
 Invoke-ColmapStage -Name "feature_extraction" -Command {
+    $cameraArguments = switch ($CameraGrouping) {
+        "single" { @("--ImageReader.single_camera", "1") }
+        "per-folder" { @("--ImageReader.single_camera_per_folder", "1") }
+        "per-image" { @("--ImageReader.single_camera_per_image", "1") }
+        "auto" { @() }
+    }
+
     & $ColmapLauncher feature_extractor `
         --database_path $databasePath `
         --image_path $ImagePath `
-        --ImageReader.single_camera 1
+        @cameraArguments
 }
 
 Invoke-ColmapStage -Name "feature_matching" -Command {

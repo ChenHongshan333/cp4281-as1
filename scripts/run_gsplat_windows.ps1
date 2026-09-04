@@ -10,6 +10,8 @@ param(
     [int[]]$EvalSteps = @(7000, 30000),
     [int[]]$SaveSteps = @(7000, 30000),
     [int]$DataFactor = 1,
+    [ValidateRange(0, 2147483647)]
+    [int]$RefineStopIter = 15000,
     [switch]$DisableVideo,
     [string]$EnvironmentPrefix = "D:\conda-envs\cp4281-as1",
     [string]$GsplatSource = "F:\CP4281-data\gsplat-1.5.3",
@@ -72,6 +74,12 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+& $python (Join-Path $PSScriptRoot "patch_gsplat_colmap_paths_windows.py") `
+    $GsplatSource
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 $trainerArguments = @(
     $trainer,
     "default",
@@ -79,6 +87,7 @@ $trainerArguments = @(
     "--data-factor", $DataFactor.ToString(),
     "--result-dir", $ResultDirectory,
     "--max-steps", $MaxSteps.ToString(),
+    "--strategy.refine-stop-iter", $RefineStopIter.ToString(),
     "--packed",
     "--disable-viewer"
 )

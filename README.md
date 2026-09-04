@@ -6,6 +6,7 @@ Gaussian Splatting.
 
 ## Tested system
 
+- AMD Ryzen 7 8745H CPU and 15.31 GiB physical RAM
 - Windows with an NVIDIA GeForce RTX 4060 Laptop GPU (8188 MiB VRAM)
 - NVIDIA driver 560.92 (`nvidia-smi` reports CUDA compatibility up to 12.6)
 - Visual Studio 2022 Community with Desktop development with C++
@@ -517,3 +518,299 @@ insufficient, the renderer's black background can also show through. The train
 undercarriage, thin structures, and novel views between captured cameras are
 particularly susceptible. This is retained as an honest reconstruction
 weakness for the report's failure analysis.
+
+### `drjohnson` COLMAP reconstruction
+
+The third sample is an indoor scene containing 263 images. Its sparse
+reconstruction was run with:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\run_colmap_sparse_windows.ps1" `
+  -ImagePath "F:\CP4281-data\sample_scenes\tandt_db\db\drjohnson\images" `
+  -WorkspacePath "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson"
+```
+
+COLMAP emitted a redundant two-image model (`sparse/0`) and a complete model
+(`sparse/1`) containing all 263 input images. The complete model is used for
+subsequent processing.
+
+| `drjohnson` COLMAP measurement | Result |
+|---|---:|
+| Feature extraction time | 00:00:11.6271974 |
+| Exhaustive matching time | 00:01:39.8161231 |
+| Incremental mapping time | 00:05:36.2886419 |
+| Model 0 | 2 registered images, 37 points |
+| Model 1 | 263/263 registered images, 79,299 points |
+| Model 1 mean track length | 4.240344 |
+| Model 1 mean observations per image | 1,278.536122 |
+| Model 1 mean reprojection error | 0.581401 px |
+
+The complete model was prepared for training with:
+
+```powershell
+& "D:\Tools\COLMAP-3.11.1\COLMAP.bat" image_undistorter `
+  --image_path "F:\CP4281-data\sample_scenes\tandt_db\db\drjohnson\images" `
+  --input_path "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\sparse\1" `
+  --output_path "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\processed" `
+  --output_type COLMAP `
+  --max_image_size 1600
+```
+
+Undistortion took `00:00:06.7060572`. The processed dataset contains all 263
+images and the adjusted COLMAP binary model.
+
+### `drjohnson` first training attempt: out of memory
+
+The first 30,000-step attempt used the same baseline densification schedule as
+the outdoor scenes, with refinement planned through step 15,000. It terminated
+after `00:21:22.2733220` before producing a checkpoint. The last TensorBoard
+entry was at step 10,600: the model had grown from 79,299 to 3,947,098 Gaussians
+and PyTorch reported 5.827 GiB of allocated GPU memory. The next densification
+operation also requires temporary memory, so this growth left insufficient
+headroom on the 8 GiB GPU.
+
+Other open applications, especially hardware-accelerated browser tabs, may
+have consumed additional GPU memory and contributed to the failure. However,
+the rapidly increasing Gaussian count was the main reproducible risk: the
+original schedule would have continued densification for another 4,400 steps.
+The failed output directory is retained as diagnostic evidence.
+
+For the retry, `scripts/run_gsplat_windows.ps1` exposes the strategy's
+`RefineStopIter` setting. Densification is stopped at step 8,000, where the
+failed run had approximately 3.07 million Gaussians and 4.45 GiB allocated.
+Optimization then continues to step 30,000 without further Gaussian growth.
+Final evaluation and checkpointing are performed at step 30,000, and video
+rendering is deferred to the separate stable-path renderer.
+
+### `drjohnson` memory-safe training result
+
+The scene was restarted from the beginning after closing other GPU-heavy
+applications. The successful retry stopped densification at step 8,000 and
+disabled the trainer's default trajectory video:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\run_gsplat_windows.ps1" `
+  -DataDirectory "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\processed" `
+  -ResultDirectory "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\training_memory_safe" `
+  -MaxSteps 30000 `
+  -EvalSteps 30000 `
+  -SaveSteps 30000 `
+  -RefineStopIter 8000 `
+  -DisableVideo
+```
+
+| Final `drjohnson` measurement | Result |
+|---|---:|
+| Training steps | 30,000 |
+| Initial Gaussians (COLMAP points) | 79,299 |
+| Final Gaussians | 3,081,715 |
+| Held-out views | 33 |
+| Held-out PSNR | 28.6254 dB |
+| Held-out SSIM | 0.89897 |
+| Held-out LPIPS | 0.17974 |
+| Peak allocated VRAM | 4.465 GiB |
+| Trainer time | 2,867.41 s (47 min 47.41 s) |
+| Total wall-clock time | 00:49:38.4779878 |
+| Final checkpoint size | 693.60 MiB |
+
+The final checkpoint is `ckpts/ckpt_29999_rank0.pt`. It contains 3,081,715
+Gaussians and was used successfully for subsequent rendering. The run also
+produced 33 paired held-out validation renders and final training and validation
+statistics. Compared with the failed attempt, stopping refinement at step 8,000
+kept the Gaussian count and memory usage bounded while allowing the remaining
+optimization steps to improve the fixed representation.
+
+### `drjohnson` stable handheld video
+
+The first stable-path attempt used one fixed up vector for every frame. This is
+invalid for this indoor capture because several cameras look nearly parallel to
+that vector, and the renderer stopped with `Estimated view direction is too
+close to the up direction`. A second `captured` attempt transported the up
+direction smoothly, but its view trajectory was still visually unsuitable.
+
+Inspection of the COLMAP poses explained the problem: ordering all 263 cameras
+by image name does not produce one continuous video-like route. Adjacent source
+views change by a median of 35.8 degrees and by as much as 153.4 degrees, and
+camera positions contain several large jumps between separate capture runs.
+Smoothing all of those original viewing directions therefore caused the video
+to alternate between the ceiling and floor.
+
+The renderer was extended with a `handheld` path mode. It splits the input at
+large positional jumps, selects the longest continuous capture run, smooths and
+constant-speed resamples its real camera positions, estimates the room's
+vertical direction from the camera-center distribution, and keeps the view
+aimed at the reconstructed scene focus. For this dataset it selected camera
+indices `[0, 79)`, corresponding to `IMG_6292.jpg` through `IMG_6380.jpg`.
+
+After checking a 180-frame preview, the final video was rendered with:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\render_smooth_orbit_windows.ps1" `
+  -DataDirectory "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\processed" `
+  -Checkpoint "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\training_memory_safe\ckpts\ckpt_29999_rank0.pt" `
+  -OutputPath "F:\CP4281-data\sample_scenes\our_reconstruction\drjohnson\training_memory_safe\videos\drjohnson_handheld_24s.mp4" `
+  -Frames 720 `
+  -Fps 30 `
+  -PathType handheld `
+  -SmoothingSigma 8
+```
+
+The final RGB video was visually inspected and accepted. It contains 720
+readable frames at 30 FPS (24.0 seconds), took 34.10 seconds to render, and
+occupies 4.61 MiB. The requested render size was 1330x874; H.264 macroblock
+padding gives a stored size of 1336x880. The accompanying JSON records the
+checkpoint, path type, selected capture segment, focus point, resolution,
+duration, and rendering wall time.
+
+## Step 4: reconstruct our own scene
+
+### Capture and input checks
+
+The self-captured scene is a static arrangement of plush toys on a bed. It was
+photographed handheld from different sides and at multiple heights, with the
+camera translated around the subject to provide parallax rather than only
+rotated in place. The dataset contains 136 readable iPhone 15 JPG images from
+`IMG_2315.jpg` through `IMG_2457.jpg` and occupies 664.19 MiB.
+
+An evenly spaced visual inspection found good viewpoint variation, stable
+subject placement, and useful texture on the bed and surrounding objects. The
+main capture weaknesses are shallow depth of field in some views, a fingertip
+visible at the edge of one image, background clutter, and two mixed image
+resolutions: 110 images at 4032x3024 and 26 at 5712x4284. Next time, one camera
+resolution and focus/exposure setting should be locked for the entire capture,
+and every frame should be checked for hands and subject blur.
+
+### COLMAP failure and mixed-resolution fix
+
+The first COLMAP attempt incorrectly forced all images to share one camera
+model. It reconstructed only the first 22 images (`IMG_2315.jpg` through
+`IMG_2336.jpg`) as one camera, 8,474 sparse points, and a 1.251378 px mean
+reprojection error. Registration stopped exactly where the source resolution
+changed from 5712x4284 to 4032x3024. This identified incompatible shared
+intrinsics, rather than generally poor image matching, as the cause.
+
+To preserve the originals without consuming another 664 MiB, the images were
+grouped into resolution-named folders using same-volume hard links:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\group_images_by_resolution.ps1" `
+  -SourceDirectory "F:\CP4281-data\own_scene\plush_toys\images" `
+  -OutputDirectory "F:\CP4281-data\own_scene\plush_toys\images_by_resolution"
+```
+
+`scripts/run_colmap_sparse_windows.ps1` was extended with a `CameraGrouping`
+option. The reconstruction was then rerun with one shared calibration per
+resolution folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\run_colmap_sparse_windows.ps1" `
+  -ImagePath "F:\CP4281-data\own_scene\plush_toys\images_by_resolution" `
+  -WorkspacePath "F:\CP4281-data\own_scene\plush_toys\reconstruction_by_resolution" `
+  -CameraGrouping per-folder
+```
+
+This produced one complete model (`sparse/0`) with both camera calibrations.
+
+| `plush_toys` COLMAP measurement | Result |
+|---|---:|
+| Feature extraction time | 00:00:35.9737272 |
+| Exhaustive matching time | 00:02:00.1717634 |
+| Incremental mapping time | 00:04:16.4842778 |
+| Total measured SfM time | 00:06:52.6297684 |
+| Registered images | 136/136 |
+| Scene fragments | 1 complete model |
+| Camera calibrations | 2 |
+| Sparse points | 46,232 |
+| Mean track length | 4.352829 |
+| Mean observations per image | 1,479.705882 |
+| Mean reprojection error | 1.260762 px |
+
+The complete model was undistorted and resized to a maximum dimension of 1600
+pixels for safer training on the 8 GiB GPU:
+
+```powershell
+& "D:\Tools\COLMAP-3.11.1\COLMAP.bat" image_undistorter `
+  --image_path "F:\CP4281-data\own_scene\plush_toys\images_by_resolution" `
+  --input_path "F:\CP4281-data\own_scene\plush_toys\reconstruction_by_resolution\sparse\0" `
+  --output_path "F:\CP4281-data\own_scene\plush_toys\processed" `
+  --output_type COLMAP `
+  --max_image_size 1600
+```
+
+The processed dataset contains all 136 images at 1600x1200. Its creation took
+approximately 25 seconds based on the output timestamps.
+
+### gsplat path compatibility fix and training
+
+The initial smoke test loaded both cameras but failed before training with
+`KeyError: '4032x3024/IMG_2337.jpg'`. COLMAP records nested paths with forward
+slashes, whereas Python's Windows relative paths use backslashes. The local
+`patch_gsplat_colmap_paths_windows.py` normalizes both representations, and the
+training and rendering wrappers apply this compatibility patch automatically.
+The repeated smoke test then completed successfully.
+
+Formal training used the memory-safe schedule established on `drjohnson`:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\run_gsplat_windows.ps1" `
+  -DataDirectory "F:\CP4281-data\own_scene\plush_toys\processed" `
+  -ResultDirectory "F:\CP4281-data\own_scene\plush_toys\training_memory_safe" `
+  -MaxSteps 30000 `
+  -EvalSteps 30000 `
+  -SaveSteps 30000 `
+  -RefineStopIter 8000 `
+  -DisableVideo
+```
+
+| Final `plush_toys` measurement | Result |
+|---|---:|
+| Training steps | 30,000 |
+| Initial Gaussians (COLMAP points) | 46,232 |
+| Final Gaussians | 1,022,274 |
+| Held-out views | 17 |
+| Held-out PSNR | 22.6270 dB |
+| Held-out SSIM | 0.69292 |
+| Held-out LPIPS | 0.30819 |
+| Peak allocated VRAM | 1.582 GiB |
+| Trainer time | 1,827.88 s (30 min 27.88 s) |
+| Total wall-clock time | 00:31:51.5940183 |
+| Final checkpoint size | 230.08 MiB |
+
+The final checkpoint is `ckpts/ckpt_29999_rank0.pt`. Visual inspection of three
+widely separated held-out views showed that the plush toys retain recognizable
+shape, color, and facial details. The main reconstruction weakness is a
+streaked or smeared appearance on the fine, repetitive bed-sheet texture,
+especially in novel views. Small toys and occlusion boundaries also soften or
+blend together. These effects are consistent with limited view coverage,
+repetitive texture, shallow focus in some source images, and interpolation
+between captured viewpoints.
+
+### Final `plush_toys` video
+
+Because this is a compact object-centered capture, a constant-speed ellipse is
+appropriate. The radius was reduced to 0.85 of the estimated capture extent to
+keep the camera near well-observed regions:
+
+```powershell
+powershell -ExecutionPolicy Bypass `
+  -File ".\scripts\render_smooth_orbit_windows.ps1" `
+  -DataDirectory "F:\CP4281-data\own_scene\plush_toys\processed" `
+  -Checkpoint "F:\CP4281-data\own_scene\plush_toys\training_memory_safe\ckpts\ckpt_29999_rank0.pt" `
+  -OutputPath "F:\CP4281-data\own_scene\plush_toys\training_memory_safe\videos\plush_toys_orbit_24s.mp4" `
+  -Frames 720 `
+  -Fps 30 `
+  -PathType ellipse `
+  -RadiusScale 0.85
+```
+
+The final video was visually inspected and accepted. It is an RGB-only H.264
+video with 720 readable frames at 30 FPS (24.0 seconds), a resolution of
+1600x1200, and a size of 12.50 MiB. Rendering took 28.65 seconds. The scripted
+trajectory looks continuously at the reconstructed focus point and is
+arc-length resampled for smooth, near-constant camera speed.

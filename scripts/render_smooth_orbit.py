@@ -93,31 +93,26 @@ def build_smoothed_capture_path(
     # After smoothing, viewmatrix(p - auxiliary, up, p) reconstructs +z.
     orientation_points = positions - focus_distance * poses[:, :3, 2]
 
-    # The sample captures form a loop. Circular Gaussian smoothing stays within
-    # the neighborhood of captured poses and removes handheld position/aim noise
-    # without the overshoot of a high-degree interpolating spline.
+    # Smooth along the recorded order without assuming that the first and last
+    # images form a loop. Some datasets contain a large pose change at that
+    # boundary, so circular smoothing would invent a bad camera move there.
     smooth_positions = gaussian_filter1d(
-        positions, sigma=smoothing_sigma, axis=0, mode="wrap"
+        positions, sigma=smoothing_sigma, axis=0, mode="nearest"
     )
     smooth_orientation = gaussian_filter1d(
-        orientation_points, sigma=smoothing_sigma, axis=0, mode="wrap"
+        orientation_points, sigma=smoothing_sigma, axis=0, mode="nearest"
+    )
+    smooth_up = gaussian_filter1d(
+        poses[:, :3, 1], sigma=smoothing_sigma, axis=0, mode="nearest"
     )
 
-    closed_positions = np.concatenate(
-        [smooth_positions, smooth_positions[:1]], axis=0
-    )
-    closed_orientation = np.concatenate(
-        [smooth_orientation, smooth_orientation[:1]], axis=0
-    )
-    segment_lengths = np.linalg.norm(np.diff(closed_positions, axis=0), axis=1)
+    segment_lengths = np.linalg.norm(np.diff(smooth_positions, axis=0), axis=1)
     cumulative_lengths = np.concatenate([[0.0], np.cumsum(segment_lengths)])
-    target_lengths = np.linspace(
-        0.0, cumulative_lengths[-1], frame_count, endpoint=False
-    )
+    target_lengths = np.linspace(0.0, cumulative_lengths[-1], frame_count)
 
     sampled_positions = np.stack(
         [
-            np.interp(target_lengths, cumulative_lengths, closed_positions[:, i])
+            np.interp(target_lengths, cumulative_lengths, smooth_positions[:, i])
             for i in range(3)
         ],
         axis=-1,
@@ -125,29 +120,131 @@ def build_smoothed_capture_path(
     sampled_orientation = np.stack(
         [
             np.interp(
-                target_lengths, cumulative_lengths, closed_orientation[:, i]
+                target_lengths, cumulative_lengths, smooth_orientation[:, i]
             )
             for i in range(3)
         ],
         axis=-1,
     )
+    sampled_up = np.stack(
+        [
+            np.interp(target_lengths, cumulative_lengths, smooth_up[:, i])
+            for i in range(3)
+        ],
+        axis=-1,
+    )
 
-    stable_up = poses[:, :3, 1].mean(axis=0)
-    stable_up /= np.linalg.norm(stable_up)
-    backward = sampled_positions - sampled_orientation
-    backward /= np.linalg.norm(backward, axis=1, keepdims=True)
-    if np.max(np.abs(backward @ stable_up)) > 0.98:
-        raise ValueError("Estimated view direction is too close to the up direction")
+    # A single world-up vector is not valid for captures that look almost
+    # vertically up or down. Start from the captured up direction, then
+    # parallel-transport it from frame to frame by projecting the previous up
+    # vector onto the new view plane. This creates the minimum necessary roll
+    # and avoids both singularities and sudden 180-degree flips. The smoothed
+    # captured up and least-aligned Cartesian axis are only fallbacks.
+    path = []
+    previous_up = None
+    for position, orientation, source_up in zip(
+        sampled_positions, sampled_orientation, sampled_up
+    ):
+        backward = position - orientation
+        backward /= np.linalg.norm(backward)
+        if previous_up is None:
+            local_up = source_up - np.dot(source_up, backward) * backward
+        else:
+            local_up = previous_up - np.dot(previous_up, backward) * backward
+        if np.linalg.norm(local_up) < 1e-6:
+            local_up = source_up - np.dot(source_up, backward) * backward
+        if np.linalg.norm(local_up) < 1e-6:
+            fallback_axis = np.eye(3)[np.argmin(np.abs(backward))]
+            local_up = fallback_axis - np.dot(fallback_axis, backward) * backward
+
+        local_up /= np.linalg.norm(local_up)
+
+        pose = viewmatrix(backward, local_up, position)
+        path.append(pose)
+        previous_up = pose[:, 1]
+
+    path = np.stack(path)
+    return path, center, path[0, :3, 1]
+
+
+def build_handheld_path(
+    poses: np.ndarray,
+    frame_count: int,
+    smoothing_sigma: float,
+    focus_point_fn,
+    viewmatrix,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Follow a continuous captured route while looking steadily into the scene."""
+    if frame_count < 2:
+        raise ValueError("frame_count must be at least 2")
+    if smoothing_sigma <= 0:
+        raise ValueError("smoothing_sigma must be positive")
+
+    positions = poses[:, :3, 3]
+    center = focus_point_fn(poses)
+
+    # COLMAP image-name order can contain separate capture runs. Split at
+    # unusually large camera jumps and retain the longest continuous run rather
+    # than interpolating through walls or across the room.
+    steps = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+    positive_steps = steps[steps > 1e-8]
+    if len(positive_steps):
+        jump_threshold = max(
+            5.0 * float(np.median(positive_steps)),
+            2.0 * float(np.percentile(positive_steps, 75)),
+        )
+        cuts = np.flatnonzero(steps > jump_threshold) + 1
+    else:
+        jump_threshold = 0.0
+        cuts = np.empty(0, dtype=int)
+    boundaries = np.concatenate([[0], cuts, [len(positions)]])
+    segment_index = int(np.argmax(np.diff(boundaries)))
+    segment_start = int(boundaries[segment_index])
+    segment_end = int(boundaries[segment_index + 1])
+    route = positions[segment_start:segment_end]
+    if len(route) < 2:
+        raise ValueError("Could not find a continuous captured camera route")
+
+    smooth_positions = gaussian_filter1d(
+        route, sigma=smoothing_sigma, axis=0, mode="nearest"
+    )
+    route_steps = np.linalg.norm(np.diff(smooth_positions, axis=0), axis=1)
+    cumulative_lengths = np.concatenate([[0.0], np.cumsum(route_steps)])
+    if cumulative_lengths[-1] <= 1e-8:
+        raise ValueError("The selected captured camera route has no movement")
+    target_lengths = np.linspace(0.0, cumulative_lengths[-1], frame_count)
+    sampled_positions = np.stack(
+        [
+            np.interp(target_lengths, cumulative_lengths, smooth_positions[:, i])
+            for i in range(3)
+        ],
+        axis=-1,
+    )
+
+    # Camera centers in an indoor handheld capture are approximately coplanar.
+    # The least-varying PCA axis therefore provides a data-driven vertical axis,
+    # without assuming that normalized scene Z is always up. Match its sign to
+    # the captured camera Y axes so the rendered image is not upside down.
+    centered_positions = positions - positions.mean(axis=0)
+    _, principal_axes = np.linalg.eigh(np.cov(centered_positions.T))
+    stable_up = principal_axes[:, 0]
+    average_camera_up = poses[:, :3, 1].mean(axis=0)
+    if np.dot(stable_up, average_camera_up) < 0.0:
+        stable_up = -stable_up
+
+    look_directions = center[None] - sampled_positions
+    look_norms = np.linalg.norm(look_directions, axis=1)
+    if np.min(look_norms) < 1e-6:
+        raise ValueError("Handheld path passes too close to the scene focus point")
+    normalized_look = look_directions / look_norms[:, None]
+    if np.max(np.abs(normalized_look @ stable_up)) > 0.98:
+        raise ValueError("Handheld view direction is too close to scene vertical")
 
     path = np.stack(
-        [
-            viewmatrix(position - orientation, stable_up, position)
-            for position, orientation in zip(
-                sampled_positions, sampled_orientation
-            )
-        ]
+        [viewmatrix(center - position, stable_up, position) for position in sampled_positions]
     )
-    return path, center, stable_up
+    detail = np.array([segment_start, segment_end, jump_threshold])
+    return path, center, detail
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,7 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument(
-        "--path-type", choices=("ellipse", "captured"), default="ellipse"
+        "--path-type", choices=("ellipse", "captured", "handheld"), default="ellipse"
     )
     parser.add_argument("--radius-scale", type=float, default=0.9)
     parser.add_argument("--smoothing-sigma", type=float, default=8.0)
@@ -216,8 +313,16 @@ def main() -> None:
             focus_point_fn=focus_point_fn,
             viewmatrix=viewmatrix,
         )
-    else:
+    elif args.path_type == "captured":
         orbit, center, path_detail = build_smoothed_capture_path(
+            source_poses,
+            frame_count=args.frames,
+            smoothing_sigma=args.smoothing_sigma,
+            focus_point_fn=focus_point_fn,
+            viewmatrix=viewmatrix,
+        )
+    else:
+        orbit, center, path_detail = build_handheld_path(
             source_poses,
             frame_count=args.frames,
             smoothing_sigma=args.smoothing_sigma,

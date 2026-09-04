@@ -11,7 +11,7 @@ param(
 
     [int]$Frames = 720,
     [int]$Fps = 30,
-    [ValidateSet("ellipse", "captured")]
+    [ValidateSet("ellipse", "captured", "handheld")]
     [string]$PathType = "ellipse",
     [double]$RadiusScale = 0.9,
     [double]$SmoothingSigma = 8.0,
@@ -73,6 +73,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & $python (Join-Path $PSScriptRoot "patch_pycolmap_windows.py")
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+& $python (Join-Path $PSScriptRoot "patch_gsplat_colmap_paths_windows.py") `
+    $GsplatSource
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
